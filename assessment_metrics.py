@@ -19,8 +19,17 @@ import json
 import re
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
+
+# ---------------------------------------------------------------------------
+# SQL Server target
+# ---------------------------------------------------------------------------
+DB_SERVER = "VIRPS0INF20D61"
+DB_NAME = "ITDashboard"
+SCHEMA_NAME = "stg"
+TABLE_NAME = "Email"
 
 try:
     import fitz
@@ -229,6 +238,89 @@ def parse_daily_counts(text: str) -> Dict[str, Dict[str, Optional[int]]]:
     return {"inbound": inbound, "outbound": outbound, "total": total}
 
 
+def parse_date_str(date_str: str) -> Optional[str]:
+    """Convert OCR date string (e.g. 'Mon 1 Jan 2024') to 'YYYY-MM-DD'."""
+    for fmt in ("%a %d %b %Y", "%a %#d %b %Y"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return None
+
+
+def write_to_database(
+    daily_counts: Dict[str, Dict[str, Optional[int]]],
+    metrics: Dict[str, Optional[int]],
+) -> None:
+    """Insert inbound/outbound email counts into the SQL Server staging table."""
+    try:
+        import pyodbc
+    except ImportError as exc:
+        raise SystemExit("Missing dependency: pip install pyodbc") from exc
+
+    # Prefer newer drivers; fall back to whatever SQL Server driver is installed.
+    _PREFERRED_DRIVERS = [
+        "ODBC Driver 18 for SQL Server",
+        "ODBC Driver 17 for SQL Server",
+        "ODBC Driver 13 for SQL Server",
+        "SQL Server Native Client 11.0",
+        "SQL Server",
+    ]
+    _available = pyodbc.drivers()
+    _driver = next(
+        (d for d in _PREFERRED_DRIVERS if d in _available),
+        None,
+    )
+    if _driver is None:
+        available_list = ", ".join(_available) or "(none)"
+        raise SystemExit(
+            f"No supported SQL Server ODBC driver found.\n"
+            f"Available drivers: {available_list}\n"
+            "Install 'ODBC Driver 18 for SQL Server' from https://aka.ms/downloadmsodbcsql"
+        )
+
+    conn_str = (
+        f"DRIVER={{{_driver}}};"
+        f"SERVER={DB_SERVER};"
+        f"DATABASE={DB_NAME};"
+        "Trusted_Connection=yes;"
+        "Encrypt=no;"
+    )
+
+    rows: List[tuple] = []
+
+    # Prefer daily-level inbound/outbound rows (each has a real date).
+    for direction, label in (("inbound", "Inbound"), ("outbound", "Outbound")):
+        for date_str, count in daily_counts.get(direction, {}).items():
+            if count is None:
+                continue
+            sql_date = parse_date_str(date_str)
+            if sql_date:
+                rows.append((sql_date, label, count))
+
+    # Fall back to summary totals keyed to today if no daily breakdown was parsed.
+    if not rows:
+        today = datetime.today().strftime("%Y-%m-%d")
+        if metrics.get("total_inbound") is not None:
+            rows.append((today, "Inbound", metrics["total_inbound"]))
+        if metrics.get("total_outbound") is not None:
+            rows.append((today, "Outbound", metrics["total_outbound"]))
+
+    if not rows:
+        print("No email counts to insert into the database.", file=sys.stderr)
+        return
+
+    insert_sql = (
+        f"INSERT INTO [{SCHEMA_NAME}].[{TABLE_NAME}] ([Date], [Item], [Value]) "
+        "VALUES (?, ?, ?)"
+    )
+    with pyodbc.connect(conn_str) as conn:
+        cursor = conn.cursor()
+        cursor.executemany(insert_sql, rows)
+        conn.commit()
+    print(f"Inserted {len(rows)} row(s) into [{DB_NAME}].[{SCHEMA_NAME}].[{TABLE_NAME}].")
+
+
 def extract_report(
     pdf_path: Path,
     pages: Optional[Sequence[int]] = None,
@@ -303,6 +395,11 @@ def main() -> None:
         "--json",
         help="Write extracted metrics to JSON file.",
     )
+    parser.add_argument(
+        "--skip-db",
+        action="store_true",
+        help="Skip writing results to the SQL Server database.",
+    )
     args = parser.parse_args()
 
     pdf_path = Path(args.pdf)
@@ -334,6 +431,9 @@ def main() -> None:
         out_path = Path(args.json)
         out_path.write_text(json.dumps(report, indent=2))
         print(f"\nWritten JSON report to {out_path}")
+
+    if not args.skip_db:
+        write_to_database(daily, metrics)
 
 
 if __name__ == "__main__":
